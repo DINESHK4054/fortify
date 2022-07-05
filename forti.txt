@@ -1,0 +1,287 @@
+package sg.com.ncs.devops
+
+import sg.com.ncs.devops.Credentials
+import sg.com.ncs.devops.FortifyConfig
+import sg.com.ncs.devops.Urls
+import java.net.URLEncoder
+import java.io.File
+import java.util.Arrays
+import groovy.io.*
+
+class CommonUtilities {
+
+    static def getGitLabGroupName(gitUrl) {
+        return gitUrl.split('/')[3]
+    }
+
+    static def getGitLabRepoName(gitUrl) {
+        return gitUrl.split('/')[4].replace('.git','')
+    }
+
+    static def createTaginGitLab(script) {
+        script.withCredentials([script.usernamePassword(credentialsId: Credentials.gitAdmin, passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+            def gitTag = "${script.BRANCH_NAME}_${getVersion(script)}"
+            def gitUrl = script.scm.userRemoteConfigs[0].url.replace('http://','')
+            script.sh "git tag ${gitTag}"
+            script.sh "git push http://${script.env.GIT_USERNAME}:${script.env.GIT_PASSWORD}@${gitUrl} ${gitTag}"
+        }
+    }
+
+    static def checkIsValidBranchName(script) {
+        def branch = script.BRANCH_NAME
+        def validEnvBranchList = ['dev','sit','uat','stg','prod','master']
+        def validBranchPrefixList = ['feature','bugfix','release','TalendPsDEV']
+        for(validEnvBranch in validEnvBranchList) {
+            if(validEnvBranch.equals(branch))
+                return true
+        }
+        def branchSplit = branch.split('/')
+        def branchPrefix = branchSplit[0]
+        if (branchSplit.length != 2)
+            script.error "error:"
+        if(!validBranchPrefixList.contains(branchPrefix))
+            script.error "error"
+        if(!branchSplit[1].contains("NN-"))
+            script.error "error"
+    }
+
+    static String geJiraIssueFromBranch(branch) {
+        try {
+            def branchSplit = branch.split('/')
+            def matcher = branchSplit[1] =~ /TEST-\d+/
+            return matcher[0]
+        }
+        catch(exception){
+            return null
+        }
+    }
+
+  static def generateChkSum(script, folder) {
+      def foundFiles = script.sh(script: "ls -1 ${folder}", returnStdout: true).split()
+      foundFiles.each {
+          script.sh "cksum ${folder}/${it} | cut -d' ' -f1 > ${folder}/${it}.cksum.txt"
+      }
+  }
+
+  static def mvn(script, args) {
+    //script.sh "echo $JAVA_HOME"
+    //script.sh "JAVA_HOME=/usr/lib/jvm/java-11-openjdk ${script.tool ToolsName.mavenName}/bin/mvn -v"
+    script.sh "JAVA_HOME=/usr/lib/jvm/java-11-openjdk ${script.tool ToolsName.mavenName}/bin/mvn -X ${args}"
+  }
+
+  static def sonarqube(script) {
+    def branch = script.BRANCH_NAME
+    def gitLabGroupName = getGitLabGroupName(script.scm.getUserRemoteConfigs()[0].getUrl())
+    def gitLabRepoName = getGitLabRepoName(script.scm.getUserRemoteConfigs()[0].getUrl())
+    def postfix = branch.replaceAll('/','-')
+    script.withSonarQubeEnv('SonarQube') {
+    
+      script.sh "JAVA_HOME=/usr/lib/jvm/java-11-openjdk ${script.tool ToolsName.mavenName}/bin/mvn -X org.sonarsource.scanner.maven:sonar-maven-plugin:3.7.0.1746:sonar -Dsonar.projectKey=${gitLabGroupName}_${gitLabRepoName}_${postfix} -Dsonar.projectName=${gitLabGroupName}_${gitLabRepoName}_${postfix} -Dsonar.host.url=${Urls.sonarQubeUrl}"
+
+    }
+  }
+
+  static def qualityGate(script) {
+        script.timeout(time: 15, unit: 'MINUTES') {
+               def qg = script.waitForQualityGate()
+               if (qg.status != 'OK') {
+                       //script.error "Pipeline aborted due to quality gate failure: ${qg.status}"
+            script.echo "WARNING: Continuing pipeline execution..... Quality Gate check failed: ${qg.status}" // This needs to be changed after fixing the sonar issues
+               }
+        }
+  }
+
+  static def postBuildStatusToJiraIssue(script) {
+    def jiraIssue = geJiraIssueFromBranch(script.BRANCH_NAME)
+    def buildResult = script.currentBuild.result
+    if(jiraIssue && (!buildResult.equals('ABORTED'))){
+      def color = '172b4d'
+      if(buildResult.equals('SUCCESS'))
+        color = '00875a'
+      if(buildResult.equals('FAILURE'))
+        color = 'de350b'
+      def comment = [ body: "*JENKINS BUILD STATUS*: {color:#${color}}*${buildResult}*{color}" ]
+      script.withEnv(["JIRA_SITE=${ToolsName.jiraName}"]) {
+        script.jiraAddComment idOrKey: jiraIssue, input: comment
+      }
+    }
+  }
+
+  static def checkFeatureIsSnapshot(script) {
+      def pom = script.readMavenPom()
+      if(!pom.version.contains('SNAPSHOT')){
+        script.currentBuild.result = 'ABORTED'
+        script.error "Build Aborted. Feature Branch is not SNAPSHOT"
+      }
+      else{
+          script.echo 'Feature Branch is SNAPSHOT'
+      }
+  }
+
+  static def checkEnvBranchIsNotSnapshot(script) {
+      def pom = script.readMavenPom()
+      if(pom.version.contains('SNAPSHOT')){
+        script.currentBuild.result = 'FAILURE'
+        script.error "Build Aborted. Environment Branch is SNAPSHOT"
+      }
+      else{
+          script.echo 'Environment Branch is NOT SNAPSHOT'
+      }
+  }
+
+    static def deployPackageToNexus(script) {
+        def branch = script.BRANCH_NAME
+        def gitLabGroupName = getGitLabGroupName(script.scm.getUserRemoteConfigs()[0].getUrl())
+        def gitLabRepoName = getGitLabRepoName(script.scm.getUserRemoteConfigs()[0].getUrl())
+        def version = getVersion(script)
+        def fullPackageName = "${getPackageName(script)}_${version}"
+        def it = '/var/lib/jenkins/workspace/StanTI_StanTI-Portal-API_master'
+
+        def files = []
+        files.each {
+          script.withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: Credentials.nexusAdmin, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+              script.echo "Files to be imported :  ${it.path}"
+              script.sh "curl -v -u ${script.env.USERNAME}:${script.env.PASSWORD} --upload-file ${it.path} ${Urls.nexusDockerHostedRepoUrl}/${gitLabGroupName}/${gitLabRepoName}/${fullPackageName}/"
+          }
+        }
+        script.echo "${Urls.nexusRepoUrlShort}/service/rest/repository/browse/ntp-releases/${gitLabGroupName}/${gitLabRepoName}/${fullPackageName}"
+    }
+    
+    static def deployPackageToArtifactory(script) {
+        
+        def branch = script.BRANCH_NAME
+        def gitLabGroupName = getGitLabGroupName(script.scm.getUserRemoteConfigs()[0].getUrl())
+        def gitLabRepoName = getGitLabRepoName(script.scm.getUserRemoteConfigs()[0].getUrl())
+        def version = getVersion(script)
+        def fullPackageName = "${getPackageName(script)}_${version}"
+        script.withCredentials([script.usernamePassword(credentialsId: 'DevOpsAdminCred', passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {  
+              script.echo "Files to be imported :  deployment/${fullPackageName}/${fullPackageName}.zip"
+              script.sh "curl -v -u ${script.env.USERNAME}:${script.env.PASSWORD} -X PUT \"${Urls.artifactoryRepoUrl}/${RepositoryNames.artifactoryStanTiRepo}/${gitLabGroupName}/${gitLabRepoName}/${branch}/${fullPackageName}/${fullPackageName}.zip\" -T ${script.WORKSPACE}/deployment/${fullPackageName}.zip"
+                
+        }
+    }
+    
+    static def getPackageName(script) {
+        def branch = script.BRANCH_NAME
+        def gitLabGroupName = getGitLabGroupName(script.scm.getUserRemoteConfigs()[0].getUrl())
+        def gitLabRepoName = getGitLabRepoName(script.scm.getUserRemoteConfigs()[0].getUrl())
+        return "${gitLabGroupName}_${gitLabRepoName}_${branch}"
+    }
+
+    static def getVersion(script) {
+        return script.VersionNumber('${BUILD_DATE_FORMATTED, \"yy-MM-dd\"}-${BUILDS_TODAY, XX}')
+    }
+
+     static def cleanUpOldDockerImages (script) {
+        script.sh "sudo docker image prune -a -f --filter \"until=\$(date +'%Y-%m-%dT%H:%M:%S' --date='-60 days')\""
+    }
+
+
+
+    def PowerShell(psCmd) {
+    psCmd=psCmd.replaceAll("%", "%%")
+    bat "C:\\Windows\\SysWOW64\\WindowsPowerShell\\v1.0\\powershell.exe -NonInteractive -ExecutionPolicy Bypass -Command \"\$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;$psCmd;EXIT \$global:LastExitCode\""
+    }
+
+    
+    
+    def getAllFiles(rootPath,script) {
+        script.echo "GetAllFiles ... ${rootPath}"
+        def list = []
+        script.echo "GetAllFiles ...list ${rootPath.list()}"
+        for (subPath in rootPath.list()) {
+            list << subPath.getName()
+            // in case you don't want extension
+            // list << FilenameUtils.removeExtension(subPath.getName())
+        }
+        script.echo "GetAllFiles ...list ${list}"
+        return list
+    }
+    
+   
+    @NonCPS
+    static def getFiles(String baseDir, script) {
+        script.echo "getFiles ...baseDir ${baseDir}"
+        script.echo "getFiles new file ...list ${new java.io.File(baseDir).toString()}"
+        script.echo "getFiles new file ...listFiles ... ${new java.io.File(baseDir).listFiles()}"       
+        return Arrays.asList(new java.io.File(baseDir).listFiles())
+    }
+    
+    static def fortyfyScan(script, fortify_source_code_location, fortify_cloudscan_version_id) {       
+        def packageName = getPackageName(script) 
+        script.sh """
+            sudo sh ${FortifyConfig.fortify_script_home}/Fortify_Scan.sh $packageName ${script.WORKSPACE} ${fortify_source_code_location} ${FortifyConfig.fortify_cloudscan_url} ${FortifyConfig.fortify_cloudscan_token} ${fortify_cloudscan_version_id}
+            [ \$? -eq 0 ] && echo "Fortify scan is successful for $packageName" || echo "Fortify scan failed for $packageName"
+        """    
+        }
+
+    static def createFortyfyScanWorkspace(script){
+         def gitUrl = script.scm.userRemoteConfigs[0].url.replace('http://','')
+         def cloneDir ="Fortify_Scan"
+         script.withCredentials([script.usernamePassword(credentialsId: Credentials.gitAdmin, passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+        script.sh '''
+                GIT_URL='''+ gitUrl +'''            
+                LATEST_DIR='''+ cloneDir +'''     
+                echo "LATEST_DIR ... $LATEST_DIR"   
+                rm -rf *             
+                mkdir ${LATEST_DIR}
+                HOME_DIR=$PWD
+                git clone -b $BRANCH_NAME http://${GIT_USERNAME}:${GIT_PASSWORD}@${GIT_URL} $LATEST_DIR
+
+            '''
+
+        }
+    }
+
+    static def checkFortifyVulnerablity (script){
+        def fullPackageName = "${getPackageName(script)}"
+            FortifyConfig.fortify_scan_vulnerability_level.each({
+               script.echo "${it.key} : ${it.value}"
+               script.sh "${FortifyConfig.fortify_scan_fpr_utility} -information -includeSuppressed -includeRemoved -search -query \'[fortify priority order]:${it.key}\' -project \"${script.WORKSPACE}/${FortifyConfig.fortify_scan_fpr_file}\" -f \"${FortifyConfig.fortify_scan_fpr_query_result_file}\""
+               def issueCount = script.sh(returnStdout: true, script: "head -n 1 ${FortifyConfig.fortify_scan_fpr_query_result_file} | cut -d ' ' -f1 2>&1").trim()   
+               script.echo " The issue count from  ${issueCount}"
+               if("No".equals(issueCount)){
+                       script.echo "Fortify: No ${it.key} Vulnerablity issues identified "
+               }
+               if(issueCount.isNumber()){
+                       script.echo "Fortify: The issue count is ${issueCount}"
+                       if(issueCount>it.value){
+                               script.error "Fortify:ERROR: The ${it.key} Vulnerablity is more than 0 "
+                       }
+               }
+               else{
+                       script.echo "The issue count is NaN"
+               }       
+            })
+        
+    }
+}
+
+
+
+Fortify:
+
+package sg.com.ncs.devops
+
+class FortifyConfig {
+  public static String fortify_cloudscan_url = 'https://stb-scan-ctrl.orchid.stb.gov.sg:8443/scancentral-ctrl/'
+  public static String fortify_cloudscan_token = 'fcf3b328-d4f7-4158-a5fe-816c55d4e21a'
+  
+  public static String fortify_cloudscan_aem_prd_version_id = '10011'
+  public static String fortify_cloudscan_aem_uat_version_id = '10012'
+  
+  public static String fortify_cloudscan_bespoke_uat_version_id = '10013'
+  public static String fortify_cloudscan_bespoke_prd_version_id = '10014'
+
+  public static String fortify_script_home = '/opt/jenkins_workspace/Scripts/Fortify_Scripts/'
+  public static String fortify_aem_src_location ='/stan-portal-aem-all/src/main' 
+  public static String fortify_bespoke_src_location ='' 
+  
+  public static String fortify_scan_fpr_utility='/opt/Fortify/Fortify_SCA_and_Apps_21.1.2/bin/FPRUtility'
+  public static String fortify_scan_fpr_file='stan-ti_stanti-portal-bespoke-app_uat-scan.fpr'
+  public static String fortify_scan_fpr_query_result_file='/opt/Fortify/output.txt'
+  
+  public static Map fortify_scan_vulnerability_level = ["critical":0, "High":0, "Medium":0]
+  
+ 
+}
